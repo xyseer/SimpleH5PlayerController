@@ -1,9 +1,10 @@
 // ==UserScript==
 // @name         Simple H5Player Controller
 // @namespace    https://github.com/xyseer
-// @version      1.0
-// @description  Control HTML5 video players: custom hotkeys, save progress, sync settings globally (Performance Optimized).
+// @version      1.1
+// @description  Control HTML5 video players: custom hotkeys, save progress, sync settings globally with smart speed memory.
 // @author       xyseer
+// @license      MIT
 // @match        *://*/*
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -22,6 +23,9 @@
     let currentFPS = GM_getValue('H5PLAYER_FPS', 30);
     let globalPlaybackSpeed = GM_getValue('H5PLAYER_GLOBAL_SPEED', 1.0);
     let globalVolume = GM_getValue('H5PLAYER_GLOBAL_VOLUME', 1.0);
+
+    // Persistent memory for the last custom speed used (defaults to 2.0 if never set)
+    let lastModifiedSpeed = GM_getValue('H5PLAYER_LAST_MODIFIED_SPEED', 2.0);
     // ----------------------------------
 
     // --- EXTENSION MENU OPTIONS ---
@@ -65,7 +69,7 @@
     let toastTimeout = null;
     let saveSpeedTimeout = null;
     let saveVolumeTimeout = null;
-    let cachedVideo = null; // Caches the active video to reduce DOM querying
+    let cachedVideo = null;
 
     function isTyping(e) {
         const target = e.target;
@@ -73,7 +77,6 @@
     }
 
     function getVideo() {
-        // If we have a cached video and it's still attached to the DOM, use it.
         if (cachedVideo && document.contains(cachedVideo)) {
             return cachedVideo;
         }
@@ -113,11 +116,9 @@
                 pointer-events: none;
                 transition: opacity 0.2s;
             `;
-            // Attach to body for global safety, calculate position manually
             document.body.appendChild(toast);
         }
 
-        // Keep toast within the video area visually
         const rect = video.getBoundingClientRect();
         toast.style.top = `${rect.top + window.scrollY + 10}px`;
         toast.style.left = `${rect.left + window.scrollX + 10}px`;
@@ -125,7 +126,6 @@
         toast.textContent = message;
         toast.style.opacity = '1';
 
-        // Clear previous timeout to prevent stacking/flickering
         if (toastTimeout) clearTimeout(toastTimeout);
 
         toastTimeout = setTimeout(() => {
@@ -133,19 +133,26 @@
         }, 1500);
     }
 
-    // Helper: Update global speed with Debounce
+    // Helper: Update global speed with Debounce & Persistent Memory
     function updateSpeed(video, newSpeed) {
-        video.playbackRate = newSpeed;
-        if (enableGlobalSpeed) {
-            globalPlaybackSpeed = newSpeed;
+        const formattedSpeed = parseFloat(newSpeed.toFixed(1));
+        video.playbackRate = formattedSpeed;
 
-            // Debounce the disk write operation (Wait 500ms after last change)
+        if (enableGlobalSpeed) {
+            globalPlaybackSpeed = formattedSpeed;
+
+            // If the user picked a speed other than 1.0, update our "last custom speed" memory
+            if (formattedSpeed !== 1.0) {
+                lastModifiedSpeed = formattedSpeed;
+                GM_setValue('H5PLAYER_LAST_MODIFIED_SPEED', lastModifiedSpeed);
+            }
+
             if (saveSpeedTimeout) clearTimeout(saveSpeedTimeout);
             saveSpeedTimeout = setTimeout(() => {
                 GM_setValue('H5PLAYER_GLOBAL_SPEED', globalPlaybackSpeed);
             }, 500);
         }
-        showToast(video, `Speed: ${video.playbackRate.toFixed(1)}x`);
+        showToast(video, `Speed: ${formattedSpeed}x`);
     }
 
     // Helper: Update global volume with Debounce
@@ -154,7 +161,6 @@
         if (enableGlobalVolume) {
             globalVolume = newVolume;
 
-            // Debounce the disk write operation (Wait 500ms after last change)
             if (saveVolumeTimeout) clearTimeout(saveVolumeTimeout);
             saveVolumeTimeout = setTimeout(() => {
                 GM_setValue('H5PLAYER_GLOBAL_VOLUME', globalVolume);
@@ -180,11 +186,12 @@
                 updateSpeed(video, Math.max(0.1, video.playbackRate - 0.1));
                 break;
             case 'z':
-                if (video.playbackRate !== 1.0) {
-                    video.playbackRate = 1.0;
-                    showToast(video, `Speed: 1.0x (Normal)`);
+                if (parseFloat(video.playbackRate.toFixed(1)) !== 1.0) {
+                    // Currently fast -> Reset to 1.0x normal speed
+                    updateSpeed(video, 1.0);
                 } else {
-                    updateSpeed(video, globalPlaybackSpeed);
+                    // Currently normal -> Apply the last modified speed
+                    updateSpeed(video, lastModifiedSpeed);
                 }
                 break;
 
@@ -232,7 +239,7 @@
             const video = e.target;
 
             // 1. Apply Global Speed
-            if (enableGlobalSpeed && globalPlaybackSpeed !== 1.0) {
+            if (enableGlobalSpeed) {
                 video.playbackRate = globalPlaybackSpeed;
             }
 
@@ -266,7 +273,6 @@
     // Continuous progress saving - Throttled when page is hidden
     if (enableResumeProgress) {
         setInterval(() => {
-            // Don't waste CPU cycles if the user isn't even looking at the tab
             if (document.hidden) return;
 
             const video = getVideo();
