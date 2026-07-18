@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Simple H5Player Controller
 // @namespace    https://github.com/xyseer
-// @version      1.1
+// @version      1.2
 // @description  Control HTML5 video players: custom hotkeys, save progress, sync settings globally with smart speed memory.
 // @author       xyseer
 // @license      MIT
@@ -98,7 +98,10 @@
     }
 
     function showToast(video, message) {
+        // Find optimal container context so toast remains visible during native fullscreen modes
+        let container = document.fullscreenElement || video.parentElement || document.body;
         let toast = document.getElementById('h5player-toast');
+        
         if (!toast) {
             toast = document.createElement('div');
             toast.id = 'h5player-toast';
@@ -116,12 +119,26 @@
                 pointer-events: none;
                 transition: opacity 0.2s;
             `;
-            document.body.appendChild(toast);
         }
 
-        const rect = video.getBoundingClientRect();
-        toast.style.top = `${rect.top + window.scrollY + 10}px`;
-        toast.style.left = `${rect.left + window.scrollX + 10}px`;
+        if (container !== document.body && window.getComputedStyle(container).position === 'static') {
+            container.style.position = 'relative';
+        }
+
+        if (toast.parentElement !== container) {
+            container.appendChild(toast);
+        }
+
+        if (container === document.body) {
+            const rect = video.getBoundingClientRect();
+            toast.style.position = 'absolute';
+            toast.style.top = `${rect.top + window.scrollY + 10}px`;
+            toast.style.left = `${rect.left + window.scrollX + 10}px`;
+        } else {
+            toast.style.position = 'absolute';
+            toast.style.top = '10px';
+            toast.style.left = '10px';
+        }
 
         toast.textContent = message;
         toast.style.opacity = '1';
@@ -131,6 +148,38 @@
         toastTimeout = setTimeout(() => {
             if (toast) toast.style.opacity = '0';
         }, 1500);
+    }
+
+    // Generates a dynamic unique tracking token mixing both full URL state and internal source stream
+    function getUniqueVideoKey(video) {
+        const url = window.location.href;
+        const src = video.currentSrc || '';
+        const combined = url + "_" + src;
+        let hash = 0;
+        for (let i = 0; i < combined.length; i++) {
+            hash = (hash << 5) - hash + combined.charCodeAt(i);
+            hash |= 0;
+        }
+        return `h5_progress_${Math.abs(hash)}`;
+    }
+
+    function safeRestoreProgress(video) {
+        if (!enableResumeProgress) return;
+
+        const progressKey = getUniqueVideoKey(video);
+        
+        // Block progress bleeding by ensuring this exact stream/URL instance hasn't been verified yet
+        if (video.__h5_last_restored_key === progressKey) return;
+
+        const savedTime = localStorage.getItem(progressKey);
+        if (savedTime && parseFloat(savedTime) > 0) {
+            const time = parseFloat(savedTime);
+            if (Math.abs(video.currentTime - time) > 2) {
+                video.currentTime = time;
+                showToast(video, `Restored to ${Math.floor(time)}s`);
+            }
+        }
+        video.__h5_last_restored_key = progressKey;
     }
 
     // Helper: Update global speed with Debounce & Persistent Memory
@@ -179,6 +228,42 @@
         let handled = true;
 
         switch(e.key.toLowerCase()) {
+            // Fullscreen Toggle
+            case 'enter':
+                if (!document.fullscreenElement) {
+                    const requestFS = video.requestFullscreen || video.webkitRequestFullscreen || video.mozRequestFullScreen || video.msRequestFullscreen;
+                    if (requestFS) {
+                        requestFS.call(video).catch(() => {
+                            if (video.parentElement) {
+                                const reqParent = video.parentElement.requestFullscreen || video.parentElement.webkitRequestFullscreen;
+                                if (reqParent) reqParent.call(video.parentElement).catch(() => {});
+                            }
+                        });
+                    }
+                } else {
+                    const exitFS = document.exitFullscreen || document.webkitExitFullscreen || document.mozCancelFullScreen || document.msExitFullscreen;
+                    if (exitFS) exitFS.call(document).catch(() => {});
+                }
+                break;
+
+            // Play / Pause Toggle
+            case ' ':
+                if (video.paused) {
+                    video.play().catch(() => {});
+                    showToast(video, "Play");
+                } else {
+                    video.pause();
+                    showToast(video, "Pause");
+                }
+                break;
+
+            // Mute / Unmute Toggle
+            case 'm':
+                video.muted = !video.muted;
+                showToast(video, video.muted ? "Muted" : `Volume: ${Math.round(video.volume * 100)}%`);
+                break;
+
+            // Speed Control
             case 'c':
                 updateSpeed(video, Math.min(16, video.playbackRate + 0.1));
                 break;
@@ -249,14 +334,7 @@
             }
 
             // 3. Apply Saved Progress
-            if (enableResumeProgress) {
-                const progressKey = `h5player_progress_${window.location.href.split('?')[0]}`;
-                const savedTime = localStorage.getItem(progressKey);
-                if (savedTime && parseFloat(savedTime) > 0) {
-                    video.currentTime = parseFloat(savedTime);
-                    showToast(video, `Restored to ${Math.floor(savedTime)}s`);
-                }
-            }
+            safeRestoreProgress(video);
 
             // 4. Auto-Play
             if (enableAutoPlay) {
@@ -270,14 +348,21 @@
         }
     }, true);
 
+    // Explicit hook interception directly onto play events captures lazy-loaded content switches on SPAs
+    window.addEventListener('play', function(e) {
+        if (e.target.tagName === 'VIDEO') {
+            safeRestoreProgress(e.target);
+        }
+    }, true);
+
     // Continuous progress saving - Throttled when page is hidden
     if (enableResumeProgress) {
         setInterval(() => {
             if (document.hidden) return;
 
             const video = getVideo();
-            const progressKey = `h5player_progress_${window.location.href.split('?')[0]}`;
             if (video && !video.paused && video.currentTime > 5) {
+                const progressKey = getUniqueVideoKey(video);
                 if (video.duration - video.currentTime > 5) {
                     localStorage.setItem(progressKey, video.currentTime);
                 } else {
